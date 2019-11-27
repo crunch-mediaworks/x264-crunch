@@ -1,0 +1,146 @@
+diff --git a/common/common.h b/common/common.h
+index b1f83efb..f9061504 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -686,6 +686,10 @@ struct x264_t
+         int     i_frame_count[3];
+         int64_t i_frame_size[3];
+         double  f_frame_qp[3];
++#if CRUNCH_ADDONS
++        double prev_qp;
++        double qp_derivative;
++#endif
+         int     i_consecutive_bframes[X264_BFRAME_MAX+1];
+         /* */
+         double  f_ssd_global[3];
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index 286b112b..4763d2ed 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1604,6 +1604,14 @@ x264_t *x264_encoder_open( x264_param_t *param )
+     if( x264_analyse_init_costs( h ) )
+         goto fail;
+ 
++    static const uint16_t cost_mv_correct[7] = { 24, 47, 95, 189, 379, 757, 1515 };
++    /* Checks for known miscompilation issues. */
++    if( h->cost_mv[X264_LOOKAHEAD_QP][2013] != cost_mv_correct[BIT_DEPTH-8] )
++    {
++        x264_log( h, X264_LOG_ERROR, "MV cost test failed: x264 has been miscompiled!\n" );
++        goto fail;
++    }
++
+     /* Must be volatile or else GCC will optimize it out. */
+     volatile int temp = 392;
+     if( x264_clz( temp ) != 23 )
+@@ -3911,6 +3919,15 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
+     h->stat.i_frame_size[h->sh.i_type] += frame_size;
+     h->stat.f_frame_qp[h->sh.i_type] += h->fdec->f_qp_avg_aq;
+ 
++#if CRUNCH_ADDONS
++    if(h->sh.i_type == SLICE_TYPE_P) {
++        if(h->stat.prev_qp != 0) {
++            h->stat.qp_derivative += (h->fdec->f_qp_avg_aq - h->stat.prev_qp);
++        }
++        h->stat.prev_qp = h->fdec->f_qp_avg_aq;
++    }
++#endif
++
+     for( int i = 0; i < X264_MBTYPE_MAX; i++ )
+         h->stat.i_mb_count[h->sh.i_type][i] += h->stat.frame.i_mb_count[i];
+     for( int i = 0; i < X264_PARTTYPE_MAX; i++ )
+@@ -4067,6 +4084,14 @@ void    x264_encoder_close  ( x264_t *h )
+     x264_opencl_lookahead_delete( h );
+     x264_opencl_function_t *ocl = h->opencl.ocl;
+ #endif
++#if CRUNCH_ADDONS
++    float cr_avgPQP = 0;
++    float cr_psnr = 0;
++    float cr_ssim = 0;
++    float cr_bitrate = 0;
++    float cr_qpDer = h->stat.qp_derivative;
++#endif
++
+ 
+     if( h->param.b_sliced_threads )
+         threadpool_wait_all( h );
+@@ -4121,6 +4146,11 @@ void    x264_encoder_close  ( x264_t *h )
+                           h->stat.f_frame_qp[i_slice] / i_count,
+                           (double)h->stat.i_frame_size[i_slice] / i_count );
+             }
++#if CRUNCH_ADDONS
++            if( i_slice == SLICE_TYPE_P ){
++                cr_avgPQP = h->stat.f_frame_qp[SLICE_TYPE_P] / i_count;
++            }
++#endif
+         }
+     }
+     if( h->param.i_bframe && h->stat.i_frame_count[SLICE_TYPE_B] )
+@@ -4222,7 +4252,9 @@ void    x264_encoder_close  ( x264_t *h )
+                                 h->stat.f_frame_duration[SLICE_TYPE_P] +
+                                 h->stat.f_frame_duration[SLICE_TYPE_B];
+         float f_bitrate = SUM3(h->stat.i_frame_size) / duration / 125;
+-
++#if CRUNCH_ADDONS
++        cr_bitrate = f_bitrate;
++#endif
+         if( PARAM_INTERLACED )
+         {
+             char *fieldstats = buf;
+@@ -4337,6 +4369,9 @@ void    x264_encoder_close  ( x264_t *h )
+         {
+             float ssim = SUM3( h->stat.f_ssim_mean_y ) / duration;
+             x264_log( h, X264_LOG_INFO, "SSIM Mean Y:%.7f (%6.3fdb)\n", ssim, calc_ssim_db( ssim ) );
++#if CRUNCH_ADDONS
++            cr_ssim = SUM3( h->stat.f_ssim_mean_y ) / duration;
++#endif
+         }
+         if( h->param.analyse.b_psnr )
+         {
+@@ -4348,11 +4383,21 @@ void    x264_encoder_close  ( x264_t *h )
+                       SUM3( h->stat.f_psnr_average ) / duration,
+                       calc_psnr( SUM3( h->stat.f_ssd_global ), duration * i_yuv_size ),
+                       f_bitrate );
++#if CRUNCH_ADDONS
++            cr_psnr = SUM3( h->stat.f_psnr_mean_y ) / duration;
++#endif
+         }
+         else
+             x264_log( h, X264_LOG_INFO, "kb/s:%.2f\n", f_bitrate );
+     }
+ 
++#if CRUNCH_ADDONS
++    //trigger callback
++    if( h->param.analysis_callback != NULL ) {
++        h->param.analysis_callback( h, cr_avgPQP, cr_psnr, cr_ssim, cr_bitrate, cr_qpDer, h->param.analysis_ctx );
++    }
++#endif
++
+     /* rc */
+     x264_ratecontrol_delete( h );
+ 
+diff --git a/x264.h b/x264.h
+index 77b6b8af..557175e5 100644
+--- a/x264.h
++++ b/x264.h
+@@ -24,6 +24,7 @@
+  * This program is also available under a commercial proprietary license.
+  * For more information, contact us at licensing@x264.com.
+  *****************************************************************************/
++#define CRUNCH_ADDONS 1
+ 
+ #ifndef X264_X264_H
+ #define X264_X264_H
+@@ -558,6 +559,13 @@ typedef struct x264_param_t
+      * e.g. if doing multiple encodes in one process.
+      */
+     void (*nalu_process)( x264_t *h, x264_nal_t *nal, void *opaque );
++
++
++#if CRUNCH_ADDONS
++    void *analysis_ctx;
++    void (*analysis_callback)( x264_t *h, float avgPQP, float psnr, float ssim, float bitrate, float qpDer, void *analysis_ctx);
++#endif
++
+ } x264_param_t;
+ 
+ void x264_nal_encode( x264_t *h, uint8_t *dst, x264_nal_t *nal );
